@@ -35,9 +35,14 @@ elif device == "cuda":
     from torch import cuda
     backend = cuda
 
-dinov2 = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14")
-dinov2.to(device)
-dinov2.eval()
+dinov2 = None
+
+def initialize_dino():
+    global dinov2
+    if dinov2 is None:
+        dinov2 = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14")
+        dinov2.to(device)
+        dinov2.eval()
 
 def epoch_schedule(x_, max_epochs=40, min_epochs=10, n_iter=4):
     """Calculates the number of epochs to train for based on the current iteration
@@ -240,6 +245,28 @@ def graph_cut_with_custom_weights(probabilities, embeddings, d, k, lambda_, cach
     }
     return labels, cache
 
+def circular_indexing(start, end, step, list_length):
+    """Returns a list of 3-tuples (start, end, step) that can be used to index
+    a list of length list_length. Start must be less than list_length, but end
+    may be greater than list_length. The function treats the list as circular,
+    so if end is greater than list_length, the indexing will wrap around to the
+    beginning of the list.
+    """
+
+    sublast = -1
+    while end > 0:
+        if sublast == -1:
+            substart = start
+        elif sublast == list_length:
+            substart = 0
+        else:
+            substart = (sublast + step) % list_length
+        subend = min(end, list_length)
+        end -= subend
+        size = (subend - substart) // step
+        sublast = (substart + ((size) * step))
+        yield (substart, subend, step)
+
 class PatchDL(torch.utils.data.Dataset):
     def __init__(self, image_tensor, initial_labels, d, batch_size):
         """Dataloader for image patches
@@ -255,35 +282,27 @@ class PatchDL(torch.utils.data.Dataset):
         self.d = d
         self.patch_size = (image_tensor.shape[2] // d, image_tensor.shape[3] // d)
         self.patches = torch.nn.functional.unfold(self.image_tensor, kernel_size=self.patch_size, stride=1, dilation=1, padding=0)
-        self.patches = self.patches.view(self.image_tensor.shape[1], self.patch_size[0], self.patch_size[1], -1).permute(3, 0, 1, 2).to(device)
+        self.patches = self.patches.reshape(self.image_tensor.shape[1], self.patch_size[0], self.patch_size[1], -1).permute(3, 0, 1, 2).to(device)
         self.train_indices = torch.cat([torch.arange(self.d) * self.patch_size[0] + ((self.image_tensor.shape[2] - (self.patch_size[0] - 1)) * self.patch_size[1] * row) for row in range(d)])
         self.train_indices = torch.stack([self.train_indices, torch.arange(self.d * self.d)], dim=1)
+        self.train_patches = self.patches[self.train_indices[:, 0]]
         self.batch_size = int(batch_size * len(self.train_indices))
         self.blank_label = torch.tensor([-1]).to(device)
+        self.idx = 0
 
     def __len__(self):
-        return len(self.patches)
+        return float("inf")
     
-    def __getitem__(self, idx):
-        if idx in self.train_indices[:, 0]:
-            # find index of idx in train_indices
-            label_idx = torch.where(self.train_indices[:, 0] == idx)[0]
-            return self.patches[idx], self.labels[self.train_indices[label_idx, 1]]
-        else:
-            return self.patches[idx], self.blank_label
-
-    def get_train_batch(self):
-        """Returns a random batch of patches with their corresponding labels from the "training set". The training set is a subset of the d^2 patches in the image that don't overlap.
-
-        Returns:
-            tensor: batch of patches represented by a (batch_size, C, H, W) tensor
-            tensor: batch of labels represented by a (batch_size, n_segments) tensor
-        """
-        batch_indices = self.train_indices[torch.randperm(self.train_indices.shape[0])[:self.batch_size]]
-        patches = self.patches[batch_indices[:, 0]]
-        labels = self.labels[batch_indices[:, 1]]
-        return patches, labels, batch_indices[:, 1]
-    
+    def __next__(self):
+        spacing = (self.d**2) // self.batch_size
+        slice_gen = circular_indexing(self.idx % self.d**2, (self.idx % self.d**2) + spacing * self.batch_size, spacing, self.d**2)
+        slices = list(slice_gen)
+        patches = torch.cat([self.train_patches[start:end:step] for start, end, step in slices], dim=0)
+        labels = torch.cat([self.labels[start:end:step] for start, end, step in slices], dim=0)
+        indices = torch.cat([torch.arange(start,end,step) for start, end, step in slices])
+        self.idx += 1
+        return patches, labels, indices, slices
+        
     def get_relabel_set(self):
         """Returns all patches in the "training set" along with their corresponding labels and indices
 
@@ -328,6 +347,7 @@ def get_DINO_embeddings(img_, d, dimensions=384):
     input_size = torch.tensor(input_size)
     dino_size = tuple((torch.ceil(input_size[0] / 14) * 14, torch.ceil(input_size[1] / 14) * 14))
     input_size = tuple(input_size)
+    initialize_dino()
     global dinov2
     with torch.no_grad():
         scale_size = max(dino_size)
@@ -397,13 +417,21 @@ class GraPLNet(torch.nn.Module):
         self.use_subset = True
         self.unfold_stride = 1
         self.make_patches = True
+        self.patch_cache = None
 
-    def forward(self, x, indices=None):
+    def forward(self, x, slices=None, indices=None):
+        if slices is not None or indices is not None:
+            if self.patch_cache is None:
+                patches = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size, dilation=1, padding=0)
+                patches = patches.view(x.shape[1], self.patch_size[0], self.patch_size[1], -1).permute(3, 0, 1, 2)
+                self.patch_cache = patches
+            else:
+                patches = self.patch_cache
+            if slices is not None:
+                x = torch.cat([patches[start:end:step] for start, end, step in slices])
+            else:
+                x = patches[indices]
         x = self.dropout0(x)
-        if indices is not None:
-            patches = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size, dilation=1, padding=0)
-            patches = patches.view(x.shape[1], self.patch_size[0], self.patch_size[1], -1).permute(3, 0, 1, 2)
-            x = patches[indices]
         x = self.conv1(x)
         # print(x.shape)
         x = self.BN1(x)
@@ -473,7 +501,8 @@ class GraPL_Segmentor:
                 use_continuity_loss=False, continuity_range=1, continuity_p=1, continuity_weight=1,
                 use_min_loss=False, use_coords=False,
                 use_crf=False, use_color_distance_weights=False,
-                initialization_method="slic", use_fully_connected=False, num_layers=3, use_collapse_penalty=False, seed=None, use_cold_start=False):
+                initialization_method="slic", use_fully_connected=False, num_layers=3, use_collapse_penalty=False,
+                seed=None, use_cold_start=False, use_graph_cut=True):
         self.d = d
         self.n_filters = n_filters
         self.dropout = dropout
@@ -517,11 +546,13 @@ class GraPL_Segmentor:
         self.use_fully_connected = use_fully_connected
         self.use_collapse_penalty = use_collapse_penalty
         self.use_cold_start = use_cold_start
+        self.use_graph_cut = use_graph_cut
         self.intermediate_collapse_penalties = []
         self.prediction = None
         self.training_time = 0
         self.prediction_time = 0
         self.seed = seed
+        self.dataloader = None
         if self.seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
@@ -566,6 +597,7 @@ class GraPL_Segmentor:
 
         # create dataloader
         self.dataloader = PatchDL(self.image_tensor, self.initial_labels, self.d, self.subset_size)
+        self.batches = self.dataloader
 
         if self.use_color_distance_weights:
             patches, _, _ = self.dataloader.get_relabel_set()
@@ -588,23 +620,30 @@ class GraPL_Segmentor:
         for iteration in range(self.iterations):
             n_epochs = self.epoch_schedule(iteration, max_epochs=self.max_epochs, min_epochs=self.min_epochs, n_iter=self.iterations)
             for epoch in range(n_epochs):
-                _, labels, indices = self.dataloader.get_train_batch()
+                _, labels, indices, slices = next(self.batches)
                 optimizer.zero_grad()
-                outputs = self.net(self.image_tensor, indices=indices).squeeze(-1).squeeze(-1)
-                most_recent_outputs_full[indices] = outputs
+                outputs = self.net(self.image_tensor, slices=slices).squeeze(-1).squeeze(-1)
+                fill_line = 0
+                for start, end, step in slices:
+                    # length = (end - start) // step
+                    length = most_recent_outputs_full[start:end:step].shape[0]
+                    most_recent_outputs_full[start:end:step] = outputs[fill_line:fill_line + length]
+                    fill_line += length
+
+                # most_recent_outputs_full[indices] = outputs
                 ce = cross_entropy(outputs, labels)
-                self.intermediate_cross_entropies.append(ce.item())
+                # self.intermediate_cross_entropies.append(ce.item())
                 loss = ce
                 if self.use_continuity_loss:
                     continuity = continuity_loss(most_recent_outputs_full) * self.continuity_weight
                     loss = loss + continuity
-                    self.intermediate_continuities.append(continuity.item())
+                    # self.intermediate_continuities.append(continuity.item())
                 if self.use_collapse_penalty:
                     probs = torch.nn.functional.softmax(outputs, dim=1)
                     entropy = - torch.sum(probs * torch.log(probs), dim=1)
                     collapse_penalty = torch.mean(entropy)
                     loss = loss + collapse_penalty
-                    self.intermediate_collapse_penalties.append(collapse_penalty.item())
+                    # self.intermediate_collapse_penalties.append(collapse_penalty.item())
                 loss.backward()
                 most_recent_outputs_full = most_recent_outputs_full.detach()
                 optimizer.step()
@@ -621,7 +660,9 @@ class GraPL_Segmentor:
                 _, _, indices = self.dataloader.get_relabel_set()
                 outputs = self.net(self.image_tensor, indices=indices).squeeze(-1).squeeze(-1)
                 probabilities = torch.nn.functional.softmax(outputs, dim=1).detach().cpu().numpy()
-                if self.use_embeddings:
+                if not self.use_graph_cut:
+                    partition = probabilities
+                elif self.use_embeddings:
                     partition, self.cached_graph_components = graph_cut_with_custom_weights(probabilities, self.embeddings, self.d, self.k, self.lambda_, cached_components=self.cached_graph_components)
                     partition = torch.tensor(partition, dtype=torch.int64)
                     partition = torch.nn.functional.one_hot(partition, self.k)

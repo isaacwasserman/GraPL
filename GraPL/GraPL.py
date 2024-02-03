@@ -8,7 +8,7 @@ import skimage.color
 import matplotlib.pyplot as plt
 import pandas as pd
 import gco
-from GraPL.evaluate import bsds_score
+from GraPL.evaluate import bsds_score, voc_score
 import torchvision
 from sklearn.decomposition import KernelPCA, PCA
 from sklearn.cluster import KMeans
@@ -701,6 +701,7 @@ class GraPL_Segmentor:
                 img = img.astype(np.uint8)
                 g = skimage.graph.rag_mean_color(img, seg, mode='similarity', sigma=255.0)
                 seg = skimage.graph.cut_normalized(seg, g, thresh=0.1)
+        seg = torch.nn.functional.interpolate(torch.tensor(seg).unsqueeze(0).unsqueeze(0).float(), self.original_image_size).squeeze(0).squeeze(0).numpy()
         self.prediction = seg
         self.prediction_time = time.time() - prediction_start
         return seg
@@ -871,6 +872,38 @@ def segment_bsds(results_dir=None, resume=False, progress_bar=None, **hyperparam
             continue
         seg = segment(image, save_path=save_path, **hyperparams)
         image_scores = bsds_score(id, save_path)
+        paramset_scores[id] = image_scores
+        progress_bar.update(1)
+    with open(f'{results_dir}/scores.json', 'w') as fp:
+        results = {"hyperparams": hyperparams, "scores": paramset_scores}
+        json.dump(results, fp)
+    return paramset_scores
+
+def segment_voc(results_dir=None, resume=False, progress_bar=None, debug_num=-1, **hyperparams):
+    if results_dir is None:
+        results_dir = f'results/BSDS_{int(time.time())}'
+    os.makedirs(results_dir, exist_ok=True)
+    with open("datasets/PascalVOC2012/VOC2012/ImageSets/Segmentation/val.txt", "r") as f:
+        val_image_ids = f.read().split("\n")
+        val_image_ids = [id for id in val_image_ids if id != ""]
+    image_paths = [f"datasets/PascalVOC2012/VOC2012/JPEGImages/{id}.jpg" for id in val_image_ids]
+    paramset_scores = {}
+    if progress_bar is None:
+        progress_bar = tqdm.tqdm(total=len(image_paths))
+    if debug_num > 0:
+        image_paths = image_paths[:debug_num]
+    for image_path in image_paths:
+        id = image_path.split('/')[-1].split('.')[0]
+        image = plt.imread(image_path)[:,:,:3]
+        image_scores = {}
+        save_path = f'{results_dir}/{id}.png'
+        if resume and os.path.exists(save_path):
+            image_scores = voc_score(id, save_path)
+            paramset_scores[id] = image_scores
+            progress_bar.update(1)
+            continue
+        seg = segment(image, save_path=save_path, **hyperparams)
+        image_scores = voc_score(id, save_path)
         paramset_scores[id] = image_scores
         progress_bar.update(1)
     with open(f'{results_dir}/scores.json', 'w') as fp:

@@ -2,6 +2,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment as linear_assignment
 import sklearn.metrics as metrics
 import skimage.metrics
+from torchmetrics import JaccardIndex
 import torch
 import glob
 import matplotlib.pyplot as plt
@@ -9,7 +10,7 @@ import tqdm
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
-def hungarian_match(preds, targets):
+def hungarian_match(preds, targets, ignore_indices=[]):
     flat_preds = preds.flatten()
     flat_targets = targets.flatten()
     num_samples = flat_targets.shape[0]
@@ -22,6 +23,8 @@ def hungarian_match(preds, targets):
 
     for pred_segment_index in range(pred_k):
         for target_segment_index in range(target_k):
+            # if target_segment_index in ignore_indices:
+            #     continue
             votes = int(((flat_preds == pred_segment_index) * (flat_targets == target_segment_index)).sum())
             num_correct[pred_segment_index, target_segment_index] = votes
 
@@ -29,8 +32,11 @@ def hungarian_match(preds, targets):
     match = np.stack(match, axis=1)
     return match
 
-def match_segmentations(seg, gt):
-    match = hungarian_match(seg, gt)
+def match_segmentations(seg, gt, ignore_indices=[]):
+    seg_values = np.unique(seg)
+    for i,v in enumerate(seg_values):
+        seg[seg == v] = i
+    match = hungarian_match(seg, gt, ignore_indices=ignore_indices)
     matched_seg = np.full_like(seg, 0)
     already_matched = []
     for i in range(max(seg.max(), gt.max()) + 1):
@@ -62,9 +68,14 @@ def accuracy(seg, targets, resize=True, match_segments=True):
     seg = match(seg, targets, size=resize, indices=match_segments)
     return metrics.accuracy_score(seg.flatten(), targets.flatten())
 
-def jaccard(seg, targets, resize=True, match_segments=True):
+def jaccard(seg, targets, resize=True, match_segments=True, ignore_indices=[]):
     seg = match(seg, targets, size=resize, indices=match_segments)
-    return metrics.jaccard_score(seg.flatten(), targets.flatten(), average='weighted')
+    jaccard = JaccardIndex(num_classes=max(len(np.unique(seg)),len(np.unique(targets))), task="multiclass", ignore_index=0, average='weighted')
+    seg = torch.tensor(seg).unsqueeze(0).unsqueeze(0)
+    targets = torch.tensor(targets).unsqueeze(0).unsqueeze(0)
+    score = jaccard(seg, targets).item()
+    return score
+    # return metrics.jaccard_score(seg.flatten(), targets.flatten(), average='weighted')
 
 def v_measure(seg, targets, resize=True, match_segments=True):
     seg = match(seg, targets, size=resize, indices=match_segments)
@@ -172,18 +183,11 @@ def bsds_score(id, segmentation_, return_mean=True):
     else:
         segmentation = segmentation_
         metadata = None
-
     
     segmentation = make_valid_segmentation(segmentation)
     gt_paths = glob.glob(f"datasets/BSDS500/gt/{id}-*.csv")
     gts = [np.genfromtxt(path, delimiter=',').astype(int) for path in gt_paths]
-    # print(segmentation.shape)
-    # print(segmentation)
     segmentation = match(segmentation, gts[0], size=True, indices=False)
-    # print(segmentation.shape)
-    # print(segmentation)
-    # plt.imshow(segmentation)
-    # plt.show()
     scores = {"f1_score": [], "accuracy": [], "jaccard": [], "v_measure": [], "segmentation_covering": [], "variation_of_information": [], "probabalistic_rand_index": [], "proportional_potts_energy": [], "delta_k": [], "k_error": [], "training_time": [], "prediction_time": [], "total_time": []}
     
     already_scored = False
@@ -227,7 +231,60 @@ def bsds_score(id, segmentation_, return_mean=True):
                 new_metadata.add_text(key, str(scores[key]))
             segmentation = Image.open(segmentation_)
             segmentation.save(segmentation_, pnginfo=new_metadata)
+    return scores
+
+def voc_score(id, seg_path, segmentation_mode="SegmentationObject", return_mean=True):
+    # Get segmentation and metadata from file
+    segmentation = Image.open(seg_path)
+    metadata = segmentation.text
+    segmentation = np.array(segmentation)
+    segmentation = make_valid_segmentation(segmentation)
     
+    # Reformat ground truth
+    gt = plt.imread(f"datasets/PascalVOC2012/VOC2012/{segmentation_mode}/{id}.png")
+    colors = np.unique(gt.reshape(-1, gt.shape[2]), axis=0)
+    ignore_mask = np.isclose(gt, [0.8784314, 0.8784314, 0.7529412, 1.       ], atol=0.01).all(axis=2)
+    background_mask = np.isclose(gt, [0, 0, 0, 1], atol=0.01).all(axis=2)
+    object_colors = colors[~np.isclose(colors, [0, 0, 0, 1], atol=0.01).all(axis=1)]
+    object_colors = object_colors[~np.isclose(object_colors, [0.8784314, 0.8784314, 0.7529412, 1], atol=0.01).all(axis=1)]
+    integer_gt = np.zeros_like(gt[:, :, 0])
+    integer_gt[ignore_mask] = 0
+    integer_gt[background_mask] = 1
+    for i in range(len(object_colors)):
+        mask_index = i + 2
+        integer_gt[np.isclose(gt, object_colors[i], atol=0.01).all(axis=2)] = mask_index
+    gt = integer_gt
+    
+    # Match and score
+    segmentation = match(segmentation, gt, size=True, indices=True)
+    scores = {"jaccard": [], "training_time": [], "prediction_time": [], "total_time": []}
+    already_scored = False
+    if metadata is not None:
+        already_scored = True
+        for key in scores.keys():
+            if key not in metadata:
+                already_scored = False
+                break
+            else:
+                scores[key].append(float(metadata[key]))
+    if not already_scored:
+        scores["jaccard"].append(jaccard(segmentation, gt, resize=False, match_segments=False, ignore_indices=[0]))
+        if metadata is not None and "k" in metadata:
+            scores["training_time"].append(float(metadata["training_time"]))
+            scores["prediction_time"].append(float(metadata["prediction_time"]))
+            scores["total_time"].append(float(metadata["total_time"]))
+    miou = jaccard(segmentation, gt, resize=True, match_segments=True, ignore_indices=[0])
+    if return_mean:
+        for key in scores.keys():
+            scores[key] = np.mean(scores[key])
+    if not already_scored:
+        new_metadata = PngInfo()
+        for key in metadata:
+            new_metadata.add_text(key, metadata[key])
+        for key in scores:
+            new_metadata.add_text(key, str(scores[key]))
+        segmentation = Image.open(seg_path)
+        segmentation.save(seg_path, pnginfo=new_metadata)
     return scores
 
 def get_score_means(scores):

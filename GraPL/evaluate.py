@@ -233,6 +233,23 @@ def bsds_score(id, segmentation_, return_mean=True):
             segmentation.save(segmentation_, pnginfo=new_metadata)
     return scores
 
+def voc_score_both_tasks(id, seg_path, return_mean=True):
+    object_scores = voc_score(id, seg_path, segmentation_mode="SegmentationObject", return_mean=return_mean)
+    class_scores = voc_score(id, seg_path, segmentation_mode="SegmentationClass", return_mean=return_mean)
+    combined_scores = {}
+    accuracy_metrics = ["f1_score", "accuracy", "jaccard", "v_measure", "segmentation_covering", "variation_of_information", "probabalistic_rand_index", "proportional_potts_energy"]
+    for key in object_scores:
+        if key in accuracy_metrics:
+            combined_scores[key + "_object"] = object_scores[key]
+        else:
+            combined_scores[key] = object_scores[key]
+    for key in class_scores:
+        if key in accuracy_metrics:
+            combined_scores[key + "_class"] = class_scores[key]
+    return combined_scores
+
+
+
 def voc_score(id, seg_path, segmentation_mode="SegmentationObject", return_mean=True):
     # Get segmentation and metadata from file
     segmentation = Image.open(seg_path)
@@ -258,33 +275,21 @@ def voc_score(id, seg_path, segmentation_mode="SegmentationObject", return_mean=
     # Match and score
     segmentation = match(segmentation, gt, size=True, indices=True)
     scores = {"jaccard": [], "training_time": [], "prediction_time": [], "total_time": []}
-    already_scored = False
-    if metadata is not None:
-        already_scored = True
-        for key in scores.keys():
-            if key not in metadata:
-                already_scored = False
-                break
-            else:
-                scores[key].append(float(metadata[key]))
-    if not already_scored:
-        scores["jaccard"].append(jaccard(segmentation, gt, resize=False, match_segments=False, ignore_indices=[0]))
-        if metadata is not None and "k" in metadata:
-            scores["training_time"].append(float(metadata["training_time"]))
-            scores["prediction_time"].append(float(metadata["prediction_time"]))
-            scores["total_time"].append(float(metadata["total_time"]))
-    miou = jaccard(segmentation, gt, resize=True, match_segments=True, ignore_indices=[0])
+    scores["jaccard"].append(jaccard(segmentation, gt, resize=False, match_segments=False, ignore_indices=[0]))
+    if metadata is not None and "k" in metadata:
+        scores["training_time"].append(float(metadata["training_time"]))
+        scores["prediction_time"].append(float(metadata["prediction_time"]))
+        scores["total_time"].append(float(metadata["total_time"]))
     if return_mean:
         for key in scores.keys():
             scores[key] = np.mean(scores[key])
-    if not already_scored:
-        new_metadata = PngInfo()
-        for key in metadata:
-            new_metadata.add_text(key, metadata[key])
-        for key in scores:
-            new_metadata.add_text(key, str(scores[key]))
-        segmentation = Image.open(seg_path)
-        segmentation.save(seg_path, pnginfo=new_metadata)
+    new_metadata = PngInfo()
+    for key in metadata:
+        new_metadata.add_text(key, metadata[key])
+    for key in scores:
+        new_metadata.add_text(key, str(scores[key]))
+    segmentation = Image.open(seg_path)
+    segmentation.save(seg_path, pnginfo=new_metadata)
     return scores
 
 def get_score_means(scores):

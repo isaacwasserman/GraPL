@@ -8,7 +8,7 @@ import skimage.color
 import matplotlib.pyplot as plt
 import pandas as pd
 import gco
-from GraPL.evaluate import bsds_score, voc_score
+from GraPL.evaluate import bsds_score, voc_score_both_tasks
 import torchvision
 from sklearn.decomposition import KernelPCA, PCA
 from sklearn.cluster import KMeans
@@ -502,7 +502,7 @@ class GraPL_Segmentor:
                 use_min_loss=False, use_coords=False,
                 use_crf=False, use_color_distance_weights=False,
                 initialization_method="slic", use_fully_connected=False, num_layers=3, use_collapse_penalty=False,
-                seed=None, use_cold_start=False, use_graph_cut=True):
+                seed=None, use_cold_start=False, use_graph_cut=True, separate_noncontiguous=False, training_scale=1.0):
         self.d = d
         self.n_filters = n_filters
         self.dropout = dropout
@@ -553,6 +553,8 @@ class GraPL_Segmentor:
         self.prediction_time = 0
         self.seed = seed
         self.dataloader = None
+        self.separate_noncontiguous = separate_noncontiguous
+        self.training_scale = training_scale
         if self.seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
@@ -568,7 +570,7 @@ class GraPL_Segmentor:
         training_start = time.time()
         self.image_tensor = torch.tensor(image, dtype=torch.float32).to(device).permute(2, 0, 1).unsqueeze(0)
         self.original_image_size = image.shape[:2]
-        resized_image_width = int(np.ceil(np.max(self.image_tensor.shape[1:]) / self.d) * self.d)
+        resized_image_width = int(np.ceil((np.max(self.image_tensor.shape[1:]) * self.training_scale) / self.d) * self.d)
         self.image_tensor = torch.nn.functional.interpolate(self.image_tensor, size=(resized_image_width, resized_image_width))
         self.image = self.image_tensor.squeeze().permute(1, 2, 0).cpu().numpy()
         image = self.image
@@ -625,33 +627,26 @@ class GraPL_Segmentor:
                 outputs = self.net(self.image_tensor, slices=slices).squeeze(-1).squeeze(-1)
                 fill_line = 0
                 for start, end, step in slices:
-                    # length = (end - start) // step
                     length = most_recent_outputs_full[start:end:step].shape[0]
                     most_recent_outputs_full[start:end:step] = outputs[fill_line:fill_line + length]
                     fill_line += length
-
-                # most_recent_outputs_full[indices] = outputs
+                    
                 ce = cross_entropy(outputs, labels)
-                # self.intermediate_cross_entropies.append(ce.item())
                 loss = ce
                 if self.use_continuity_loss:
                     continuity = continuity_loss(most_recent_outputs_full) * self.continuity_weight
                     loss = loss + continuity
-                    # self.intermediate_continuities.append(continuity.item())
                 if self.use_collapse_penalty:
+                    weight = float(self.use_collapse_penalty)
                     probs = torch.nn.functional.softmax(outputs, dim=1)
                     entropy = - torch.sum(probs * torch.log(probs), dim=1)
-                    collapse_penalty = torch.mean(entropy)
+                    collapse_penalty = torch.mean(entropy) * weight
                     loss = loss + collapse_penalty
-                    # self.intermediate_collapse_penalties.append(collapse_penalty.item())
                 loss.backward()
                 most_recent_outputs_full = most_recent_outputs_full.detach()
                 optimizer.step()
                 if iteration == 0 and loss.item() < 1:
-                    # print("stopping first iteration early on epoch", epoch)
                     break
-            
-            previous_params = copy.deepcopy(self.net.state_dict())
 
             # Skip graph step on last iteration
             if iteration != self.iterations - 1:
@@ -664,20 +659,22 @@ class GraPL_Segmentor:
                     partition = probabilities
                 elif self.use_embeddings:
                     partition, self.cached_graph_components = graph_cut_with_custom_weights(probabilities, self.embeddings, self.d, self.k, self.lambda_, cached_components=self.cached_graph_components)
-                    partition = torch.tensor(partition, dtype=torch.int64)
-                    partition = torch.nn.functional.one_hot(partition, self.k)
                 elif self.use_color_distance_weights:
                     partition, self.cached_graph_components = graph_cut_with_custom_weights(probabilities, patch_avg_colors, self.d, self.k, self.lambda_, cached_components=self.cached_graph_components)
-                    partition = torch.tensor(partition, dtype=torch.int64)
-                    partition = torch.nn.functional.one_hot(partition, self.k)
                 elif self.use_fully_connected:
                     modified_lambda_ = self.lambda_ / self.d
                     partition, self.cached_graph_components = graph_cut_with_custom_weights(probabilities, torch.ones(self.d ** 2, 1), self.d, self.k, modified_lambda_, cached_components=self.cached_graph_components)
-                    partition = torch.tensor(partition, dtype=torch.int64)
-                    partition = torch.nn.functional.one_hot(partition, self.k)
                 else:
-                    partition = torch.tensor(graph_cut(probabilities, self.d, self.k, self.lambda_), dtype=torch.int64)
-                    partition = torch.nn.functional.one_hot(partition, self.k)
+                    partition = graph_cut(probabilities, self.d, self.k, self.lambda_)
+                if self.separate_noncontiguous:
+                    partition = partition.reshape(self.d, self.d)
+                    partition = skimage.morphology.label(partition, background=-1)
+                    partition = skimage.morphology.remove_small_objects(partition, min_size=100, connectivity=1)
+                    partition = skimage.segmentation.relabel_sequential(partition)[0]
+                    partition = partition % self.k.item()
+                    partition = partition.reshape(-1)
+                partition = torch.tensor(partition, dtype=torch.int64)
+                partition = torch.nn.functional.one_hot(partition, self.k)
                 self.dataloader.labels = torch.Tensor(partition).to(device).argmax(dim=1).type(torch.long)
                 if self.use_cold_start:
                     self.net = GraPLNet(patch_size=self.patch_size, n_filters=self.n_filters, n_input_channels=self.image_tensor.shape[1], dropout=self.dropout, k=self.k, bottleneck_dim=self.bottleneck_dim, num_layers=self.num_layers).to(device)
@@ -702,6 +699,10 @@ class GraPL_Segmentor:
                 g = skimage.graph.rag_mean_color(img, seg, mode='similarity', sigma=255.0)
                 seg = skimage.graph.cut_normalized(seg, g, thresh=0.1)
         seg = torch.nn.functional.interpolate(torch.tensor(seg).unsqueeze(0).unsqueeze(0).float(), self.original_image_size).squeeze(0).squeeze(0).numpy()
+        if self.separate_noncontiguous:
+            seg = skimage.morphology.label(seg, background=-1)
+            seg = skimage.morphology.remove_small_objects(seg, min_size=100, connectivity=2)
+            seg = skimage.segmentation.relabel_sequential(seg)[0]
         self.prediction = seg
         self.prediction_time = time.time() - prediction_start
         return seg
@@ -762,7 +763,7 @@ def side_by_side(images, titles=None, height=3):
     if len(images) == 1:
         axes = [axes]
     for i, image in enumerate(images):
-        axes[i].imshow(image)
+        axes[i].imshow(image, cmap="tab20" if len(image.shape) == 2 else None)
         axes[i].axis("off")
         if titles is not None:
             axes[i].set_title(titles[i])
@@ -898,12 +899,12 @@ def segment_voc(results_dir=None, resume=False, progress_bar=None, debug_num=-1,
         image_scores = {}
         save_path = f'{results_dir}/{id}.png'
         if resume and os.path.exists(save_path):
-            image_scores = voc_score(id, save_path)
+            image_scores = voc_score_both_tasks(id, save_path)
             paramset_scores[id] = image_scores
             progress_bar.update(1)
             continue
         seg = segment(image, save_path=save_path, **hyperparams)
-        image_scores = voc_score(id, save_path)
+        image_scores = voc_score_both_tasks(id, save_path)
         paramset_scores[id] = image_scores
         progress_bar.update(1)
     with open(f'{results_dir}/scores.json', 'w') as fp:

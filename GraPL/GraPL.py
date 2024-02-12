@@ -502,7 +502,7 @@ class GraPL_Segmentor:
                 use_min_loss=False, use_coords=False,
                 use_crf=False, use_color_distance_weights=False,
                 initialization_method="slic", use_fully_connected=False, num_layers=3, use_collapse_penalty=False,
-                seed=None, use_cold_start=False, use_graph_cut=True, separate_noncontiguous=False, training_scale=1.0):
+                seed=None, use_cold_start=False, use_graph_cut=True, separate_noncontiguous_at_prediction=False, separate_noncontiguous_at_training=False, training_scale=1.0):
         self.d = d
         self.n_filters = n_filters
         self.dropout = dropout
@@ -553,7 +553,8 @@ class GraPL_Segmentor:
         self.prediction_time = 0
         self.seed = seed
         self.dataloader = None
-        self.separate_noncontiguous = separate_noncontiguous
+        self.separate_noncontiguous_at_prediction = separate_noncontiguous_at_prediction
+        self.separate_noncontiguous_at_training = separate_noncontiguous_at_training
         self.training_scale = training_scale
         if self.seed is not None:
             torch.manual_seed(seed)
@@ -666,7 +667,7 @@ class GraPL_Segmentor:
                     partition, self.cached_graph_components = graph_cut_with_custom_weights(probabilities, torch.ones(self.d ** 2, 1), self.d, self.k, modified_lambda_, cached_components=self.cached_graph_components)
                 else:
                     partition = graph_cut(probabilities, self.d, self.k, self.lambda_)
-                if self.separate_noncontiguous:
+                if self.separate_noncontiguous_at_training:
                     partition = partition.reshape(self.d, self.d)
                     partition = skimage.morphology.label(partition, background=-1)
                     partition = skimage.morphology.remove_small_objects(partition, min_size=100, connectivity=1)
@@ -699,7 +700,7 @@ class GraPL_Segmentor:
                 g = skimage.graph.rag_mean_color(img, seg, mode='similarity', sigma=255.0)
                 seg = skimage.graph.cut_normalized(seg, g, thresh=0.1)
         seg = torch.nn.functional.interpolate(torch.tensor(seg).unsqueeze(0).unsqueeze(0).float(), self.original_image_size).squeeze(0).squeeze(0).numpy()
-        if self.separate_noncontiguous:
+        if self.separate_noncontiguous_at_prediction:
             seg = skimage.morphology.label(seg, background=-1)
             seg = skimage.morphology.remove_small_objects(seg, min_size=100, connectivity=2)
             seg = skimage.segmentation.relabel_sequential(seg)[0]

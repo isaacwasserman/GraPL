@@ -13,8 +13,6 @@ warnings.filterwarnings("ignore")
 with open("datasets/PascalVOC2012/VOC2012/ImageSets/Segmentation/val.txt", "r") as f:
     val_image_ids = f.read().split("\n")
 
-segmentation_mode = "SegmentationObject"
-
 params = {
     'iterations': 4,
     'k': 14,

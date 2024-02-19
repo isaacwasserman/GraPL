@@ -1,3 +1,5 @@
 datasets/BSDS500
 datasets/PascalVOC2012
 datasets/PascalVOC2012.zip
+datasets/CocoStuff_curated_coarse_val_only.zip
+datasets/CocoStuff_curated_coarse_val_only

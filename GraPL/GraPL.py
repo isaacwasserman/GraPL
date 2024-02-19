@@ -912,3 +912,36 @@ def segment_voc(results_dir=None, resume=False, progress_bar=None, debug_num=-1,
         results = {"hyperparams": hyperparams, "scores": paramset_scores}
         json.dump(results, fp)
     return paramset_scores
+
+def segment_coco_val(results_dir=None, resume=False, progress_bar=None, debug_num=-1, should_score=True, **hyperparams):
+    if results_dir is None:
+        raise ValueError("results_dir must be specified")
+    os.makedirs(results_dir, exist_ok=True)
+    val_image_ids = [os.path.basename(f) for f in glob.glob('datasets/CocoStuff_curated_coarse_val_only/images/val2017/*')]
+    val_image_ids = [f.split('.')[0] for f in val_image_ids]
+    image_paths = [f"datasets/CocoStuff_curated_coarse_val_only/images/val2017/{id}.jpg" for id in val_image_ids]
+    paramset_scores = {}
+    if progress_bar is None:
+        progress_bar = tqdm.tqdm(total=len(image_paths))
+    if debug_num > 0:
+        image_paths = image_paths[:debug_num]
+    for image_path in image_paths:
+        id = image_path.split('/')[-1].split('.')[0]
+        image = plt.imread(image_path)[:,:,:3]
+        image_scores = {}
+        save_path = f'{results_dir}/{id}.png'
+        if resume and os.path.exists(save_path):
+            if should_score:
+                image_scores = coco_score(id, save_path)
+                paramset_scores[id] = image_scores
+            progress_bar.update(1)
+            continue
+        seg = segment(image, save_path=save_path, **hyperparams)
+        if should_score:
+            image_scores = coco_score(id, save_path)
+            paramset_scores[id] = image_scores
+        progress_bar.update(1)
+    with open(f'{results_dir}/scores.json', 'w') as fp:
+        results = {"hyperparams": hyperparams, "scores": paramset_scores}
+        json.dump(results, fp)
+    return paramset_scores
